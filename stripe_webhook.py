@@ -3,14 +3,16 @@ import stripe
 import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI, Request, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 
+# ----------------- ENV -----------------
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 
-BOT_USERNAME = "mu_sic_aibot"  # твой бот
+BOT_USERNAME = os.getenv("BOT_USERNAME", "mu_sic_aibot").strip()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://musicai-webhook.onrender.com").strip()
 
 stripe.api_key = STRIPE_SECRET_KEY
 app = FastAPI()
@@ -18,6 +20,7 @@ app = FastAPI()
 PACK_TO_SONGS = {"pack_1": 1, "pack_5": 5, "pack_30": 30}
 
 
+# ----------------- DB -----------------
 def db_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set")
@@ -37,8 +40,6 @@ def init_db():
             );
             """
         )
-
-        # защита от повторного начисления по одному и тому же Checkout Session
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS stripe_purchases (
@@ -50,7 +51,6 @@ def init_db():
             );
             """
         )
-
         conn.commit()
 
 
@@ -60,28 +60,17 @@ def add_balance_once(session_id: str, user_id: int, pack: str, songs: int) -> bo
     Возвращает True если начислило, False если session_id уже был обработан.
     """
     with db_conn() as conn:
-        conn.execute(
-            "INSERT INTO users(user_id) VALUES(%s) ON CONFLICT DO NOTHING",
-            (user_id,),
-        )
-
+        conn.execute("INSERT INTO users(user_id) VALUES(%s) ON CONFLICT DO NOTHING", (user_id,))
         try:
             conn.execute(
-                """
-                INSERT INTO stripe_purchases(session_id, user_id, pack, songs)
-                VALUES (%s, %s, %s, %s)
-                """,
+                "INSERT INTO stripe_purchases(session_id, user_id, pack, songs) VALUES (%s, %s, %s, %s)",
                 (session_id, user_id, pack, songs),
             )
         except Exception:
-            # уже есть такой session_id -> значит начисляли ранее
             conn.rollback()
             return False
 
-        conn.execute(
-            "UPDATE users SET balance = balance + %s WHERE user_id=%s",
-            (songs, user_id),
-        )
+        conn.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s", (songs, user_id))
         conn.commit()
         return True
 
@@ -91,8 +80,7 @@ def _startup():
     init_db()
 
 
-# ---------- CREATE CHECKOUT SESSION ----------
-
+# ----------------- CREATE CHECKOUT -----------------
 class CreateCheckoutBody(BaseModel):
     user_id: int           # telegram user id
     pack: str              # pack_1 / pack_5 / pack_30
@@ -107,9 +95,12 @@ async def create_checkout(body: CreateCheckoutBody):
     if body.pack not in PACK_TO_SONGS:
         raise HTTPException(status_code=400, detail="Unknown pack")
 
-    # ВАЖНО: тут f-string -> плейсхолдер Stripe должен остаться {CHECKOUT_SESSION_ID}
-    success_url = f"https://t.me/{BOT_USERNAME}?start=paid_{{CHECKOUT_SESSION_ID}}"
-    cancel_url = f"https://t.me/{BOT_USERNAME}?start=cancel"
+    if not PUBLIC_BASE_URL:
+        raise HTTPException(status_code=500, detail="PUBLIC_BASE_URL not set")
+
+    # Надёжный возврат: сначала на нашу страницу, потом в Telegram (tg:// + кнопка)
+    success_url = f"{PUBLIC_BASE_URL}/stripe/success?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{PUBLIC_BASE_URL}/stripe/cancel"
 
     try:
         session = stripe.checkout.Session.create(
@@ -129,8 +120,45 @@ async def create_checkout(body: CreateCheckoutBody):
     return {"checkout_url": session.url, "session_id": session.id}
 
 
-# ---------- WEBHOOK ----------
+# ----------------- SUCCESS/CANCEL PAGES -----------------
+@app.get("/stripe/success", response_class=HTMLResponse)
+def stripe_success(session_id: str):
+    tme = f"https://t.me/{BOT_USERNAME}?start=paid_{session_id}"
+    tg = f"tg://resolve?domain={BOT_USERNAME}&start=paid_{session_id}"
 
+    return HTMLResponse(f"""
+<!doctype html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Return</title></head>
+<body style="font-family:system-ui;padding:24px;">
+<h3>Оплата прошла ✅</h3>
+<p>Если Telegram не открылся автоматически — нажми кнопку ниже.</p>
+<p><a href="{tme}" style="font-size:18px;">↩️ Вернуться в бота</a></p>
+<script>
+  setTimeout(() => {{ window.location.href = "{tg}"; }}, 50);
+  setTimeout(() => {{ window.location.href = "{tme}"; }}, 900);
+</script>
+</body></html>
+""")
+
+
+@app.get("/stripe/cancel", response_class=HTMLResponse)
+def stripe_cancel():
+    tme = f"https://t.me/{BOT_USERNAME}?start=cancel"
+    return HTMLResponse(f"""
+<!doctype html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cancel</title></head>
+<body style="font-family:system-ui;padding:24px;">
+<h3>Оплата отменена</h3>
+<p><a href="{tme}" style="font-size:18px;">↩️ Вернуться в бота</a></p>
+</body></html>
+""")
+
+
+# ----------------- WEBHOOK -----------------
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
     if not STRIPE_WEBHOOK_SECRET:
@@ -148,7 +176,7 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
 
-        # Страховка: начисляем только если реально paid
+        # начисляем только если реально paid
         if session.get("payment_status") != "paid":
             return JSONResponse({"ok": True, "ignored": "not_paid"})
 
@@ -159,7 +187,12 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
 
         if session_id and user_id and pack in PACK_TO_SONGS:
             songs = PACK_TO_SONGS[pack]
-            added = add_balance_once(session_id=session_id, user_id=int(user_id), pack=pack, songs=songs)
-            return {"ok": True, "credited": added}
+            credited = add_balance_once(
+                session_id=session_id,
+                user_id=int(user_id),
+                pack=pack,
+                songs=songs,
+            )
+            return {"ok": True, "credited": credited}
 
     return {"ok": True}
